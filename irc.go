@@ -6,25 +6,26 @@ import (
   "net"
   "os"
   "log"
+  "strings"
+  "container/list"
 )
 
 
 type IRCEvent struct {
-  Code string
-  Message string
+  Command string
   Raw string
   Nick string //<nick>
   Host string //<nick>!<usr>@<host>
   Source string //<host>
   User string //<usr>
-
-  Arguments []string
+  Args []string
 }
 
 
 type IRC struct {
   conn net.Conn
   stdlog, errlog *log.Logger
+  Callbacks map[string]*list.List
 
   read, write chan string // Raw in/out
   readsync, writesync chan bool
@@ -60,17 +61,20 @@ func reader(irc *IRC) {
   br := bufio.NewReader(irc.conn)
   for {
     msg, err := br.ReadString('\n') 
+
     if err != nil {
       irc.errlog.Printf("Error while reading: %s", err)
       irc.err <- err
     }
     if msg != "" {
-      irc.read <- msg
+      irc.read <- strings.Trim(msg, "\r\n")
     }
+
     // Check if it is time to exit
     select {
     case <-irc.readsync:
       return
+    default:
     }
   }
 }
@@ -107,12 +111,17 @@ func (irc *IRC) Connect(nick, server string) error {
 
   go writer(irc)
   go reader(irc)
+
+  irc.addcallbacks()
+
   irc.SendRaw(fmt.Sprintf("NICK %s", irc.nick))
   irc.SendRaw(fmt.Sprintf("USER %s 0.0.0.0 0.0.0.0 :%s", irc.nick, irc.nick))
+  irc.Join("#go-start")
+  irc.Privmsg("#go-start", "test")
   return nil
 }
 
-func (irc *IRC) ReConnect() error {
+func (irc *IRC) Reconnect() error {
   irc.stdlog.Println("Reconnecting")
   // Close read/write channels
   close(irc.read)
@@ -123,6 +132,51 @@ func (irc *IRC) ReConnect() error {
   // Tell server we are leaving
   irc.Quit()
   return irc.Connect(irc.nick, irc.server)
+}
+
+func (irc *IRC) Loop() {
+  for msg := range irc.read {
+    event := &IRCEvent{Raw: msg}
+
+    // Source is either entire ident or server name
+    if msg[0] == ':' {
+      if idx := strings.Index(msg, " "); idx != -1 {
+        event.Source, msg = msg[1:idx], msg[idx+1:]
+      }
+    }
+    event.Host = event.Source
+    nidx := strings.Index(event.Source, "!")
+    uidx := strings.Index(event.Source, "@")
+
+    // Check that we aren't going to panic
+    // Then parse out host
+    if nidx != -1 && uidx != -1 {
+      event.Nick = event.Source[:nidx]
+      event.User = event.Source[nidx+1:uidx-1]
+      event.Host = event.Source[uidx+1:]
+    }
+
+    // Get the command and arguments
+    args := strings.SplitN(msg, " :", 2)
+    if len(args) > 1 {
+      args = append(strings.Fields(args[0]), args[1])
+    } else {
+        args = strings.Fields(args[0])
+    }
+    event.Command = strings.ToUpper(args[0])
+    if len(args) > 1 {
+      event.Args = args[1:]
+    }
+    irc.runcallback(event)
+
+    select {
+      case err := (<-irc.err): {
+        irc.errlog.Println(err)
+        irc.Reconnect()
+      }
+    default:
+    }
+  }
 }
 
 // Send text directly to server.
@@ -148,4 +202,11 @@ func (irc *IRC) Privmsg(target, message string) {
 
 func (irc *IRC) Notice(target, message string) {
   irc.SendRaw(fmt.Sprintf("NOTICE %s :%s", target, message))
+}
+
+
+func main() {
+  irc := &IRC{}
+  irc.Connect("go-bot-test123", "irc.freenode.net:6667")
+  irc.Loop()
 }
