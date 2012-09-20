@@ -37,9 +37,9 @@ type IRC struct {
 
 func writer(irc *IRC)  {
   for output := range irc.write {
-    // If socket is nil, log
-    if irc.socket == nil {
-      irc.stdlog.Println("irc.socket is nil when writing")
+    // If conn is nil, log
+    if irc.conn == nil {
+      irc.stdlog.Println("irc.conn is nil when writing")
       break
     }
     // If nothing is to be sent, don't send it
@@ -47,7 +47,7 @@ func writer(irc *IRC)  {
       break
     }
     // Attempt to write
-    if _, err := irc.socket.Write([]byte(output)); err != nil {
+    if _, err := irc.conn.Write([]byte(output)); err != nil {
       irc.errlog.Printf("Error in writer(): &s\n", err)
       irc.err <- err
     }
@@ -57,8 +57,21 @@ func writer(irc *IRC)  {
 // Find a good way for main thread to communicate when routine should close
 // Possibly have a channel specificaly for this task.  
 func reader(irc *IRC) {
-  br := bufio.NewReader(irc.socket)
-  for msg, err := br.ReadString('\n') {
+  br := bufio.NewReader(irc.conn)
+  for {
+    msg, err := br.ReadString('\n') 
+    if err != nil {
+      irc.errlog.Printf("Error while reading: %s", err)
+      irc.err <- err
+    }
+    if msg != "" {
+      irc.read <- msg
+    }
+    // Check if it is time to exit
+    select {
+    case <-irc.readsync:
+      return
+    }
   }
 }
 
@@ -79,7 +92,8 @@ func (irc *IRC) Connect(nick, server string) error {
 
 
   irc.stdlog.Printf("Attempting to connect to: %s\n", irc.server)
-  if irc.socket, err := net.Dial("tcp", irc.server); err != nil {
+  var err error
+  if irc.conn, err = net.Dial("tcp", irc.server); err != nil {
     irc.errlog.Printf("Failed to connect to %s: %s\n", irc.server, err)
     return err
   }
@@ -91,10 +105,11 @@ func (irc *IRC) Connect(nick, server string) error {
   irc.readsync = make(chan bool)
   irc.writesync = make(chan bool)
 
-  go writer(irc.write)
-
-  irc.SendRaw(fmt.Sprintf("NICK %s", irc.nick)
-  irc.SendRaw(fmt.Sprintf("USER %s 0.0.0.0 0.0.0.0 :%s", irc.nick, irc.nick)
+  go writer(irc)
+  go reader(irc)
+  irc.SendRaw(fmt.Sprintf("NICK %s", irc.nick))
+  irc.SendRaw(fmt.Sprintf("USER %s 0.0.0.0 0.0.0.0 :%s", irc.nick, irc.nick))
+  return nil
 }
 
 func (irc *IRC) ReConnect() error {
@@ -103,11 +118,11 @@ func (irc *IRC) ReConnect() error {
   close(irc.read)
   close(irc.write)
   // Let last read/write finish
-  <- irc.readsync
+  irc.readsync <- true
   <- irc.writesync
   // Tell server we are leaving
   irc.Quit()
-  irc.Connect()
+  return irc.Connect(irc.nick, irc.server)
 }
 
 // Send text directly to server.
@@ -115,7 +130,7 @@ func (irc *IRC) SendRaw(output string) {
   irc.write <- fmt.Sprintf("%s\r\n", output)
 }
 
-func (irc *IRC) Quit(channel string) {
+func (irc *IRC) Quit() {
   irc.SendRaw("QUIT")
 }
 
